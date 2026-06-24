@@ -1,0 +1,7 @@
+# Copy to .dev.vars and fill in your values
+# GitHub OAuth app credentials (optional — leave empty to disable GitHub login)
+GITHUB_CLIENT_SECRET=
+# App deep link scheme for OAuth callback redirect
+APP_DEEP_LINK_SCHEME=risuko
+# Sender email address for OTP emails (must be on a domain onboarded to Cloudflare Email Service)
+EMAIL_FROM=noreply@yourdomain.com

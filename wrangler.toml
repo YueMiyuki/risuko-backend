@@ -1,0 +1,63 @@
+name = "risuko-sync"
+main = "src/index.ts"
+compatibility_date = "2025-06-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "risuko-sync"
+database_id = "220ddca5-6bc3-4763-a602-9e889d45f7ef"
+migrations_dir = "migrations"
+
+[[send_email]]
+name = "EMAIL"
+allowed_sender_addresses = ["noreply@risuko.app"]
+
+[[ratelimits]]
+name = "RATE_LIMITER"
+namespace_id = "1001"
+[ratelimits.simple]
+limit = 120
+period = 60
+
+# OTP: 10 per 60s per email (Cache API handles longer 30s cooldown)
+[[ratelimits]]
+name = "OTP_LIMITER"
+namespace_id = "1002"
+[ratelimits.simple]
+limit = 10
+period = 60
+
+# Verify: 20 per 60s per email (Cache API handles 10s cooldown)
+[[ratelimits]]
+name = "VERIFY_LIMITER"
+namespace_id = "1003"
+[ratelimits.simple]
+limit = 20
+period = 60
+
+[[routes]]
+pattern = "api.risuko.app"
+custom_domain = true
+
+[triggers]
+crons = ["0 3 * * *"]
+
+[vars]
+APP_DEEP_LINK_SCHEME = "risuko"
+EMAIL_FROM = "noreply@risuko.app"
+GITHUB_CLIENT_ID = "Ov23lil8ptx4L2txG8qp"
+
+[observability]
+enabled = false
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = true
+persist = true
+head_sampling_rate = 1

@@ -1,0 +1,23 @@
+{
+	"name": "risuko-sync-backend",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"dev": "wrangler dev",
+		"deploy": "wrangler deploy",
+		"db:create": "wrangler d1 create risuko-sync",
+		"db:migrate": "wrangler d1 execute risuko-sync --file=schema.sql",
+		"db:migrate:local": "wrangler d1 execute risuko-sync --local --file=schema.sql",
+		"typecheck": "tsc --noEmit",
+		"fmt": "pnpx @biomejs/biome format --write"
+	},
+	"dependencies": {
+		"hono": "^4.7.0"
+	},
+	"devDependencies": {
+		"@cloudflare/workers-types": "^4.20250614.0",
+		"typescript": "^5.8.0",
+		"wrangler": "^4.4.0"
+	}
+}
