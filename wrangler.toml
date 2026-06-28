@@ -39,8 +39,13 @@ period = 60
 pattern = "api.risuko.app"
 custom_domain = true
 
+# Hourly: short-TTL rows
 [triggers]
-crons = ["0 3 * * *"]
+crons = ["0 * * * *"]
+
+[[migrations]]
+tag = "v1"
+deleted_classes = ["ShareSignalingRoom"]
 
 [vars]
 APP_DEEP_LINK_SCHEME = "risuko"

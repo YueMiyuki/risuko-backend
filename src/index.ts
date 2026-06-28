@@ -1,22 +1,30 @@
 import { Hono } from "hono";
+import type { Context } from "hono";
 import { cors } from "hono/cors";
 import { checkCooldown } from "./cache";
 import {
-	cleanupExpiredMagicLinkTokens,
-	cleanupExpiredSessions,
+	cleanupExpired,
+	consumeMagicLinkTokenByEmailAndCode,
+	consumeMagicLinkTokenByToken,
 	createMagicLinkToken,
 	createSession,
+	createShareSession,
 	createUser,
 	deleteSession,
 	deleteSettings,
+	deleteShareSession,
+	fulfillShareSession,
 	generateOTP,
-	getMagicLinkTokenByToken,
-	getMagicLinkTokenByEmailAndCode,
 	getOrCreateUserByEmail,
 	getSettings,
+	getShareSessionById,
+	resolveShareSessionByDeviceCode,
+	resolveShareSessionById,
 	getUserByEmail,
 	getUserByGithubId,
-	markMagicLinkTokenUsed,
+	getUserBySessionToken,
+	type ShareDirection,
+	type ShareSessionRow,
 	type UserRow,
 	upsertSettings,
 } from "./db";
@@ -27,6 +35,7 @@ import {
 	getGithubUser,
 } from "./github";
 import { authMiddleware } from "./middleware";
+import { buildShareLandingPage, type ShareFileMeta } from "./share";
 export interface Env {
 	DB: D1Database;
 	EMAIL: SendEmail;
@@ -155,7 +164,7 @@ app.post("/auth/verify-otp", async (c) => {
 
 	const normalizedEmail = email.toLowerCase();
 
-	// 10s per email 
+	// 10s per email
 	if (!c.env.DISABLE_RATE_LIMIT) {
 		const inCooldown = await checkCooldown(`verify:${normalizedEmail}`, 10);
 		if (inCooldown) {
@@ -177,18 +186,12 @@ app.post("/auth/verify-otp", async (c) => {
 		}
 	}
 
-	const tokenRow = await getMagicLinkTokenByEmailAndCode(
+	const tokenRow = await consumeMagicLinkTokenByEmailAndCode(
 		c.env.DB,
 		normalizedEmail,
 		code,
 	);
-
 	if (!tokenRow) {
-		return c.json({ error: "Invalid or expired verification code" }, 400);
-	}
-
-	const tokenUsed = await markMagicLinkTokenUsed(c.env.DB, tokenRow.id);
-	if (!tokenUsed) {
 		return c.json({ error: "Invalid or expired verification code" }, 400);
 	}
 
@@ -212,13 +215,8 @@ app.get("/auth/magic-link/callback", async (c) => {
 		return c.json({ error: "Missing magic link token" }, 400);
 	}
 
-	const tokenRow = await getMagicLinkTokenByToken(c.env.DB, token);
+	const tokenRow = await consumeMagicLinkTokenByToken(c.env.DB, token);
 	if (!tokenRow) {
-		return c.json({ error: "Invalid or expired magic link" }, 400);
-	}
-
-	const tokenUsed = await markMagicLinkTokenUsed(c.env.DB, tokenRow.id);
-	if (!tokenUsed) {
 		return c.json({ error: "Invalid or expired magic link" }, 400);
 	}
 
@@ -418,6 +416,236 @@ app.delete("/settings", authMiddleware, async (c) => {
 	return c.json({ success: true });
 });
 
+const SHARE_TTL_SECONDS = 60 * 60; // 1 hour
+const MAX_SHARE_FILES = 256;
+
+type ShareContext = Context<{ Bindings: Env; Variables: Vars }>;
+
+async function resolveOptionalUserId(c: ShareContext): Promise<string | null> {
+	const authHeader = c.req.header("Authorization");
+	if (!authHeader?.startsWith("Bearer ")) {
+		return null;
+	}
+	const user = await getUserBySessionToken(c.env.DB, authHeader.slice(7));
+	return user?.id ?? null;
+}
+
+function sanitizeFileMeta(input: unknown): ShareFileMeta[] {
+	if (!Array.isArray(input)) {
+		return [];
+	}
+	const files: ShareFileMeta[] = [];
+	for (const entry of input.slice(0, MAX_SHARE_FILES)) {
+		if (!entry || typeof entry !== "object") {
+			continue;
+		}
+		const name = (entry as { name?: unknown }).name;
+		const size = (entry as { size?: unknown }).size;
+		if (typeof name !== "string") {
+			continue;
+		}
+		files.push({
+			name: name.slice(0, 1024),
+			size: typeof size === "number" && Number.isFinite(size) ? size : 0,
+		});
+	}
+	return files;
+}
+
+function parseFileMeta(raw: string | null): ShareFileMeta[] {
+	if (!raw) {
+		return [];
+	}
+	try {
+		return sanitizeFileMeta(JSON.parse(raw));
+	} catch {
+		return [];
+	}
+}
+
+function shareSessionToJson(session: ShareSessionRow) {
+	return {
+		shareId: session.id,
+		deviceCode: session.device_code,
+		direction: session.direction,
+		ticket: session.ticket,
+		files: parseFileMeta(session.file_meta),
+		expiresAt: session.expires_at,
+	};
+}
+
+async function shareRateLimit(
+	c: ShareContext,
+	bucket: string,
+	cooldownSeconds: number,
+): Promise<Response | null> {
+	if (c.env.DISABLE_RATE_LIMIT) {
+		return null;
+	}
+	const ip = c.req.header("CF-Connecting-IP") || "unknown";
+	const inCooldown = await checkCooldown(
+		`share:${bucket}:${ip}`,
+		cooldownSeconds,
+	);
+	if (inCooldown) {
+		return c.json({ error: "Too many requests. Please slow down." }, 429);
+	}
+	const { success } = await c.env.RATE_LIMITER.limit({
+		key: `share:${bucket}:${ip}`,
+	});
+	if (!success) {
+		return c.json({ error: "Rate limit exceeded. Please slow down." }, 429);
+	}
+	return null;
+}
+
+app.post("/share", authMiddleware, async (c) => {
+	const limited = await shareRateLimit(c, "create", 2);
+	if (limited) {
+		return limited;
+	}
+
+	const body = await c.req.json<{
+		direction?: string;
+		ticket?: string;
+		files?: unknown;
+	}>();
+
+	const direction = body.direction;
+	if (direction !== "send" && direction !== "receive") {
+		return c.json({ error: "direction must be 'send' or 'receive'" }, 400);
+	}
+
+	if (direction === "send" && !body.ticket) {
+		return c.json(
+			{ error: "ticket is required when direction is 'send'" },
+			400,
+		);
+	}
+
+	const files = sanitizeFileMeta(body.files);
+	const userId = c.get("userId");
+	const expiresAt = Math.floor(Date.now() / 1000) + SHARE_TTL_SECONDS;
+
+	const session = await createShareSession(c.env.DB, {
+		direction: direction as ShareDirection,
+		ticket: direction === "send" ? body.ticket : null,
+		fileMeta: files.length > 0 ? JSON.stringify(files) : null,
+		userId,
+		expiresAt,
+	});
+
+	const url = `${new URL(c.req.url).origin}/share/${session.device_code}`;
+	return c.json({ ...shareSessionToJson(session), url });
+});
+
+app.get("/share/code/:code", authMiddleware, async (c) => {
+	const limited = await shareRateLimit(c, "resolve", 1);
+	if (limited) {
+		return limited;
+	}
+	const code = c.req.param("code");
+	if (!code) {
+		return c.json({ error: "Missing device code" }, 400);
+	}
+	const userId = c.get("userId");
+	const session = await resolveShareSessionByDeviceCode(c.env.DB, code, userId);
+	if (!session) {
+		return c.json({ error: "Invalid or expired device code" }, 404);
+	}
+	return c.json(shareSessionToJson(session));
+});
+
+app.post("/share/:id/fulfill", authMiddleware, async (c) => {
+	const limited = await shareRateLimit(c, "fulfill", 1);
+	if (limited) {
+		return limited;
+	}
+	const id = c.req.param("id");
+	if (!id) {
+		return c.json({ error: "Missing share id" }, 400);
+	}
+	const body = await c.req.json<{ ticket?: string; files?: unknown }>();
+	if (!body.ticket) {
+		return c.json({ error: "ticket is required" }, 400);
+	}
+	const files = sanitizeFileMeta(body.files);
+	const ok = await fulfillShareSession(
+		c.env.DB,
+		id,
+		body.ticket,
+		files.length > 0 ? JSON.stringify(files) : null,
+	);
+	if (!ok) {
+		return c.json(
+			{ error: "Share session not found, already fulfilled, or expired" },
+			404,
+		);
+	}
+	const session = await getShareSessionById(c.env.DB, id);
+	if (!session) {
+		return c.json({ error: "Share session not found" }, 404);
+	}
+	return c.json(shareSessionToJson(session));
+});
+
+app.delete("/share/:id", authMiddleware, async (c) => {
+	const id = c.req.param("id");
+	if (!id) {
+		return c.json({ error: "Missing share id" }, 400);
+	}
+	const userId = c.get("userId");
+	const session = await getShareSessionById(c.env.DB, id);
+	if (session?.user_id && session.user_id !== userId) {
+		return c.json({ error: "Not authorized to revoke this share" }, 403);
+	}
+	await deleteShareSession(c.env.DB, id);
+	return c.json({ success: true });
+});
+
+app.get("/share/:id", async (c) => {
+	const limited = await shareRateLimit(c, "get", 1);
+	if (limited) {
+		return limited;
+	}
+	const id = c.req.param("id");
+
+	const wantsJson =
+		c.req.query("format") === "json" ||
+		(c.req.header("Accept") || "").includes("application/json");
+	if (wantsJson) {
+		const userId = await resolveOptionalUserId(c);
+		if (!userId) {
+			return c.json({ error: "Authentication required" }, 401);
+		}
+		const session = await resolveShareSessionById(c.env.DB, id, userId);
+		if (!session) {
+			return c.json({ error: "Invalid or expired share link" }, 404);
+		}
+		return c.json(shareSessionToJson(session));
+	}
+
+	const session = await getShareSessionById(c.env.DB, id);
+
+	if (!session) {
+		return c.html(
+			"<!doctype html><meta charset='utf-8'><title>Risuko</title><p style='font-family:system-ui;padding:32px'>This share link is invalid or has expired.</p>",
+			404,
+		);
+	}
+
+	const scheme = c.env.APP_DEEP_LINK_SCHEME || "risuko";
+	const html = buildShareLandingPage({
+		shareId: session.id,
+		deviceCode: session.device_code,
+		direction: session.direction,
+		files: parseFileMeta(session.file_meta),
+		deepLinkScheme: scheme,
+		locale: c.req.query("locale") ?? undefined,
+	});
+	return c.html(html);
+});
+
 app.all("*", (c) => {
 	return c.json({ error: "Not found" }, 404);
 });
@@ -427,16 +655,13 @@ export default {
 	scheduled: async (event: ScheduledEvent, env: Env, ctx: ExecutionContext) => {
 		console.log("[Risuko] scheduled cleanup started", event.cron);
 		ctx.waitUntil(
-			Promise.all([
-				cleanupExpiredMagicLinkTokens(env.DB).then((count) =>
-					console.log("[Risuko] cleaned up expired magic link tokens:", count),
-				),
-				cleanupExpiredSessions(env.DB).then((count) =>
-					console.log("[Risuko] cleaned up expired sessions:", count),
-				),
-			]).catch((err) => {
-				console.error("[Risuko] scheduled cleanup failed:", err);
-			}),
+			cleanupExpired(env.DB)
+				.then((counts) =>
+					console.log("[Risuko] scheduled cleanup removed:", counts),
+				)
+				.catch((err) => {
+					console.error("[Risuko] scheduled cleanup failed:", err);
+				}),
 		);
 	},
 };

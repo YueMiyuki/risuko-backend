@@ -1,11 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+	cleanupExpired,
+	consumeMagicLinkTokenByEmailAndCode,
+	createShareSession,
 	createUser,
-	cleanupExpiredMagicLinkTokens,
+	fulfillShareSession,
+	generateDeviceCode,
 	generateOTP,
 	getUserBySessionToken,
-	markMagicLinkTokenUsed,
+	resolveShareSessionByDeviceCode,
+	resolveShareSessionById,
 } from "../src/db.ts";
 
 test("generateOTP does not depend on Math.random", () => {
@@ -95,13 +100,164 @@ test("getUserBySessionToken uses one joined lookup", async () => {
 	});
 });
 
-test("markMagicLinkTokenUsed updates the token exactly once", async () => {
+test("consumeMagicLinkTokenByEmailAndCode validates and marks used in one statement", async () => {
 	let prepareCalls = 0;
-	let updateSql = "";
+	let sql = "";
 
+	const db = {
+		prepare(q) {
+			prepareCalls += 1;
+			sql = q;
+			return {
+				bind() {
+					return this;
+				},
+				async first() {
+					return {
+						id: "tok_1",
+						email: "a@b.com",
+						code: "123456",
+						expires_at: 1,
+						used: 1,
+						created_at: 1,
+					};
+				},
+			};
+		},
+	};
+
+	const row = await consumeMagicLinkTokenByEmailAndCode(
+		db,
+		"A@B.com",
+		"123456",
+	);
+
+	assert.equal(prepareCalls, 1);
+	assert.match(sql, /UPDATE magic_link_tokens/);
+	assert.match(sql, /RETURNING/);
+	assert.equal(row.id, "tok_1");
+});
+
+test("cleanupExpired batches all deletes into one round trip", async () => {
+	const sqlCalls = [];
+	let batchCalls = 0;
+
+	const db = {
+		prepare(q) {
+			return {
+				bind() {
+					sqlCalls.push(q);
+					return this;
+				},
+			};
+		},
+		async batch(statements) {
+			batchCalls += 1;
+			assert.equal(statements.length, 3);
+			return [
+				{ meta: { changes: 1 } },
+				{ meta: { changes: 2 } },
+				{ meta: { changes: 3 } },
+			];
+		},
+	};
+
+	const counts = await cleanupExpired(db);
+
+	assert.equal(batchCalls, 1);
+	assert.match(
+		sqlCalls[0],
+		/DELETE FROM magic_link_tokens WHERE expires_at <= \? OR used = 1/,
+	);
+	assert.deepEqual(counts, {
+		magicLinkTokens: 1,
+		sessions: 2,
+		shareSessions: 3,
+	});
+});
+
+test("generateDeviceCode produces unambiguous fixed-length codes", () => {
+	const code = generateDeviceCode(8);
+	assert.equal(code.length, 8);
+	// Crockford base32 alphabet excludes I, L, O, U and lowercase.
+	assert.match(code, /^[0-9A-HJKMNP-TV-Z]{8}$/);
+});
+
+test("createShareSession inserts once and returns the row", async () => {
+	const originalNow = Date.now;
+	Date.now = () => 1_700_000_000_000;
+
+	let prepareCalls = 0;
+	let insertSql = "";
 	const db = {
 		prepare(sql) {
 			prepareCalls += 1;
+			insertSql = sql;
+			return {
+				bind() {
+					return this;
+				},
+				async run() {
+					return { meta: { changes: 1 } };
+				},
+			};
+		},
+	};
+
+	try {
+		const session = await createShareSession(db, {
+			direction: "send",
+			ticket: "blob-ticket",
+			fileMeta: JSON.stringify([{ name: "a.bin", size: 10 }]),
+			userId: null,
+			expiresAt: 1_700_003_600,
+		});
+		assert.equal(prepareCalls, 1);
+		assert.match(insertSql, /INSERT INTO share_sessions/);
+		assert.equal(session.direction, "send");
+		assert.equal(session.ticket, "blob-ticket");
+		assert.equal(session.expires_at, 1_700_003_600);
+		assert.equal(session.created_at, 1_700_000_000);
+		assert.match(session.device_code, /^[0-9A-HJKMNP-TV-Z]{8}$/);
+	} finally {
+		Date.now = originalNow;
+	}
+});
+
+test("createShareSession retries on a device-code collision", async () => {
+	let runCalls = 0;
+	const db = {
+		prepare() {
+			return {
+				bind() {
+					return this;
+				},
+				async run() {
+					runCalls += 1;
+					if (runCalls === 1) {
+						throw new Error(
+							"UNIQUE constraint failed: share_sessions.device_code",
+						);
+					}
+					return { meta: { changes: 1 } };
+				},
+			};
+		},
+	};
+
+	const session = await createShareSession(db, {
+		direction: "receive",
+		expiresAt: 1_700_003_600,
+	});
+	assert.equal(runCalls, 2);
+	assert.equal(session.direction, "receive");
+	assert.equal(session.ticket, null);
+});
+
+test("fulfillShareSession only updates an unfulfilled receive session", async () => {
+	let updateSql = "";
+	const db = {
+		prepare(sql) {
 			updateSql = sql;
 			return {
 				bind() {
@@ -114,38 +270,84 @@ test("markMagicLinkTokenUsed updates the token exactly once", async () => {
 		},
 	};
 
-	await markMagicLinkTokenUsed(db, "token_123");
-
-	assert.equal(prepareCalls, 1);
-	assert.match(updateSql, /UPDATE magic_link_tokens SET used = 1/);
+	const ok = await fulfillShareSession(db, "share_1", "blob-ticket", null);
+	assert.equal(ok, true);
+	assert.match(updateSql, /UPDATE share_sessions/);
+	assert.match(updateSql, /direction = 'receive' AND ticket IS NULL/);
 });
 
-test("cleanupExpiredMagicLinkTokens uses targeted deletes", async () => {
-	const sqlCalls = [];
-	let callIndex = 0;
-
+test("resolveShareSessionByDeviceCode consumes send sessions for non-owners", async () => {
+	const session = {
+		id: "share_send",
+		device_code: "ABCD1234",
+		direction: "send",
+		ticket: "blob-ticket",
+		file_meta: null,
+		user_id: "owner",
+		expires_at: 1_700_003_600,
+		created_at: 1_700_000_000,
+	};
+	let deleteSql = "";
 	const db = {
 		prepare(sql) {
-			sqlCalls.push(sql);
-			callIndex += 1;
+			if (/DELETE FROM share_sessions/.test(sql)) {
+				deleteSql = sql;
+				return {
+					bind() {
+						return this;
+					},
+					async first() {
+						return session;
+					},
+				};
+			}
+			throw new Error(`unexpected query: ${sql}`);
+		},
+	};
+
+	const resolved = await resolveShareSessionByDeviceCode(
+		db,
+		"abcd1234",
+		"peer",
+	);
+	assert.equal(resolved?.id, "share_send");
+	assert.match(deleteSql, /direction = 'send'/);
+	assert.match(deleteSql, /user_id != \?/);
+});
+
+test("resolveShareSessionById blocks non-owners once a receive ticket exists", async () => {
+	const session = {
+		id: "share_recv",
+		device_code: "WXYZ5678",
+		direction: "receive",
+		ticket: "blob-ticket",
+		file_meta: null,
+		user_id: "owner",
+		expires_at: 1_700_003_600,
+		created_at: 1_700_000_000,
+	};
+	let prepareCalls = 0;
+	const db = {
+		prepare(sql) {
+			prepareCalls += 1;
 			return {
 				bind() {
 					return this;
 				},
-				async run() {
-					return { meta: { changes: callIndex } };
+				async first() {
+					if (/DELETE FROM share_sessions/.test(sql)) {
+						return null;
+					}
+					if (/SELECT/.test(sql)) {
+						return session;
+					}
+					return null;
 				},
 			};
 		},
 	};
 
-	const removed = await cleanupExpiredMagicLinkTokens(db);
-
-	assert.equal(sqlCalls.length, 2);
-	assert.match(
-		sqlCalls[0],
-		/DELETE FROM magic_link_tokens WHERE expires_at <= \?/,
-	);
-	assert.match(sqlCalls[1], /DELETE FROM magic_link_tokens WHERE used = 1/);
-	assert.equal(removed, 3);
+	const resolved = await resolveShareSessionById(db, "share_recv", "peer");
+	assert.equal(resolved, null);
+	assert.equal(prepareCalls, 2);
 });

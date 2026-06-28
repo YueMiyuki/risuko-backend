@@ -37,6 +37,22 @@ export interface MagicLinkTokenRow {
 	created_at: number;
 }
 
+export type ShareDirection = "send" | "receive";
+
+export interface ShareSessionRow {
+	id: string;
+	device_code: string;
+	direction: ShareDirection;
+	ticket: string | null;
+	file_meta: string | null;
+	user_id: string | null;
+	expires_at: number;
+	created_at: number;
+}
+
+const SHARE_SESSION_COLUMNS =
+	"id, device_code, direction, ticket, file_meta, user_id, expires_at, created_at";
+
 function unixNowSeconds(): number {
 	return Math.floor(Date.now() / 1000);
 }
@@ -62,6 +78,28 @@ export function generateId(): string {
 
 export function generateToken(): string {
 	return generateRandomHexToken(32);
+}
+
+// Crockford base32 (no I, L, O, U) — unambiguous for typing/reading aloud.
+const DEVICE_CODE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+const SHARE_DEVICE_CODE_RE = /^[0-9A-HJKMNP-TV-Z]{8}$/;
+
+function shareLookupKey(key: string): { byCode: boolean; value: string } {
+	const trimmed = key.trim();
+	const upper = trimmed.toUpperCase();
+	if (SHARE_DEVICE_CODE_RE.test(upper)) {
+		return { byCode: true, value: upper };
+	}
+	return { byCode: false, value: trimmed };
+}
+
+export function generateDeviceCode(length = 8): string {
+	const bytes = generateRandomBytes(length);
+	let code = "";
+	for (const byte of bytes) {
+		code += DEVICE_CODE_ALPHABET[byte % DEVICE_CODE_ALPHABET.length];
+	}
+	return code;
 }
 
 export function generateOTP(): string {
@@ -104,71 +142,277 @@ export async function createMagicLinkToken(
 	return { magicToken };
 }
 
-export async function getMagicLinkTokenByToken(
-	db: D1Database,
-	magicToken: string,
-): Promise<MagicLinkTokenRow | null> {
-	const result = await db
-		.prepare(
-			`SELECT ${MAGIC_LINK_TOKEN_COLUMNS}
-			 FROM magic_link_tokens
-			 WHERE magic_token = ? AND used = 0 AND expires_at > ?
-			 ORDER BY created_at DESC
-			 LIMIT 1`,
-		)
-		.bind(magicToken, unixNowSeconds())
-		.first<MagicLinkTokenRow>();
-	return result ?? null;
-}
-
-export async function getMagicLinkTokenByEmailAndCode(
+export async function consumeMagicLinkTokenByEmailAndCode(
 	db: D1Database,
 	email: string,
 	code: string,
 ): Promise<MagicLinkTokenRow | null> {
 	const result = await db
 		.prepare(
-			`SELECT ${MAGIC_LINK_TOKEN_COLUMNS}
-			 FROM magic_link_tokens
-			 WHERE email = ? AND code = ? AND used = 0 AND expires_at > ?
-			 ORDER BY created_at DESC
-			 LIMIT 1`,
+			`UPDATE magic_link_tokens
+			 SET used = 1
+			 WHERE id = (
+			   SELECT id FROM magic_link_tokens
+			   WHERE email = ? AND code = ? AND used = 0 AND expires_at > ?
+			   ORDER BY created_at DESC
+			   LIMIT 1
+			 )
+			 RETURNING ${MAGIC_LINK_TOKEN_COLUMNS}`,
 		)
 		.bind(email.toLowerCase(), code, unixNowSeconds())
 		.first<MagicLinkTokenRow>();
 	return result ?? null;
 }
 
-export async function markMagicLinkTokenUsed(
+export async function consumeMagicLinkTokenByToken(
+	db: D1Database,
+	magicToken: string,
+): Promise<MagicLinkTokenRow | null> {
+	const result = await db
+		.prepare(
+			`UPDATE magic_link_tokens
+			 SET used = 1
+			 WHERE id = (
+			   SELECT id FROM magic_link_tokens
+			   WHERE magic_token = ? AND used = 0 AND expires_at > ?
+			   ORDER BY created_at DESC
+			   LIMIT 1
+			 )
+			 RETURNING ${MAGIC_LINK_TOKEN_COLUMNS}`,
+		)
+		.bind(magicToken, unixNowSeconds())
+		.first<MagicLinkTokenRow>();
+	return result ?? null;
+}
+
+export interface CleanupCounts {
+	magicLinkTokens: number;
+	sessions: number;
+	shareSessions: number;
+}
+
+export async function cleanupExpired(db: D1Database): Promise<CleanupCounts> {
+	const now = unixNowSeconds();
+	const results = await db.batch([
+		db
+			.prepare(
+				"DELETE FROM magic_link_tokens WHERE expires_at <= ? OR used = 1",
+			)
+			.bind(now),
+		db.prepare("DELETE FROM sessions WHERE expires_at <= ?").bind(now),
+		db.prepare("DELETE FROM share_sessions WHERE expires_at <= ?").bind(now),
+	]);
+	return {
+		magicLinkTokens: results[0]?.meta?.changes ?? 0,
+		sessions: results[1]?.meta?.changes ?? 0,
+		shareSessions: results[2]?.meta?.changes ?? 0,
+	};
+}
+
+export async function createShareSession(
+	db: D1Database,
+	params: {
+		direction: ShareDirection;
+		ticket?: string | null;
+		fileMeta?: string | null;
+		userId?: string | null;
+		expiresAt: number;
+	},
+): Promise<ShareSessionRow> {
+	const id = generateId();
+	const createdAt = unixNowSeconds();
+	const ticket = params.ticket ?? null;
+	const fileMeta = params.fileMeta ?? null;
+	const userId = params.userId ?? null;
+
+	// Retry on the device-code collision
+	for (let attempt = 0; attempt < 5; attempt += 1) {
+		const deviceCode = generateDeviceCode();
+		try {
+			await db
+				.prepare(
+					`INSERT INTO share_sessions
+					 (id, device_code, direction, ticket, file_meta, user_id, expires_at, created_at)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+				)
+				.bind(
+					id,
+					deviceCode,
+					params.direction,
+					ticket,
+					fileMeta,
+					userId,
+					params.expiresAt,
+					createdAt,
+				)
+				.run();
+			return {
+				id,
+				device_code: deviceCode,
+				direction: params.direction,
+				ticket,
+				file_meta: fileMeta,
+				user_id: userId,
+				expires_at: params.expiresAt,
+				created_at: createdAt,
+			};
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			if (!/UNIQUE/i.test(message)) {
+				throw err;
+			}
+		}
+	}
+	throw new Error("Failed to allocate a unique device code");
+}
+
+export async function getShareSessionById(
 	db: D1Database,
 	id: string,
+): Promise<ShareSessionRow | null> {
+	const lookup = shareLookupKey(id);
+	const result = await db
+		.prepare(
+			lookup.byCode
+				? `SELECT ${SHARE_SESSION_COLUMNS}
+				   FROM share_sessions
+				   WHERE device_code = ? AND expires_at > ?
+				   LIMIT 1`
+				: `SELECT ${SHARE_SESSION_COLUMNS}
+				   FROM share_sessions
+				   WHERE id = ? AND expires_at > ?
+				   LIMIT 1`,
+		)
+		.bind(lookup.value, unixNowSeconds())
+		.first<ShareSessionRow>();
+	return result ?? null;
+}
+
+export async function getShareSessionByDeviceCode(
+	db: D1Database,
+	deviceCode: string,
+): Promise<ShareSessionRow | null> {
+	const result = await db
+		.prepare(
+			`SELECT ${SHARE_SESSION_COLUMNS}
+			 FROM share_sessions
+			 WHERE device_code = ? AND expires_at > ?
+			 LIMIT 1`,
+		)
+		.bind(deviceCode.toUpperCase(), unixNowSeconds())
+		.first<ShareSessionRow>();
+	return result ?? null;
+}
+
+export async function resolveShareSessionByDeviceCode(
+	db: D1Database,
+	deviceCode: string,
+	resolverUserId: string,
+): Promise<ShareSessionRow | null> {
+	const now = unixNowSeconds();
+	const code = deviceCode.toUpperCase();
+
+	const sendPickup = await db
+		.prepare(
+			`DELETE FROM share_sessions
+			 WHERE device_code = ? AND expires_at > ? AND direction = 'send'
+			   AND (user_id IS NULL OR user_id != ?)
+			 RETURNING ${SHARE_SESSION_COLUMNS}`,
+		)
+		.bind(code, now, resolverUserId)
+		.first<ShareSessionRow>();
+	if (sendPickup) {
+		return sendPickup;
+	}
+
+	const session = await getShareSessionByDeviceCode(db, code);
+	if (!session) {
+		return null;
+	}
+
+	return resolveShareSessionRow(db, session, resolverUserId, now);
+}
+
+export async function resolveShareSessionById(
+	db: D1Database,
+	id: string,
+	resolverUserId: string,
+): Promise<ShareSessionRow | null> {
+	const now = unixNowSeconds();
+	const lookup = shareLookupKey(id);
+
+	const sendPickup = await db
+		.prepare(
+			lookup.byCode
+				? `DELETE FROM share_sessions
+				   WHERE device_code = ? AND expires_at > ? AND direction = 'send'
+				     AND (user_id IS NULL OR user_id != ?)
+				   RETURNING ${SHARE_SESSION_COLUMNS}`
+				: `DELETE FROM share_sessions
+				   WHERE id = ? AND expires_at > ? AND direction = 'send'
+				     AND (user_id IS NULL OR user_id != ?)
+				   RETURNING ${SHARE_SESSION_COLUMNS}`,
+		)
+		.bind(lookup.value, now, resolverUserId)
+		.first<ShareSessionRow>();
+	if (sendPickup) {
+		return sendPickup;
+	}
+
+	const session = await getShareSessionById(db, id);
+	if (!session) {
+		return null;
+	}
+
+	return resolveShareSessionRow(db, session, resolverUserId, now);
+}
+
+async function resolveShareSessionRow(
+	db: D1Database,
+	session: ShareSessionRow,
+	resolverUserId: string,
+	now: number,
+): Promise<ShareSessionRow | null> {
+	if (session.direction === "receive" && session.ticket) {
+		if (session.user_id !== resolverUserId) {
+			return null;
+		}
+		const ownerPickup = await db
+			.prepare(
+				`DELETE FROM share_sessions
+				 WHERE id = ? AND user_id = ? AND ticket IS NOT NULL AND expires_at > ?
+				 RETURNING ${SHARE_SESSION_COLUMNS}`,
+			)
+			.bind(session.id, resolverUserId, now)
+			.first<ShareSessionRow>();
+		return ownerPickup ?? session;
+	}
+
+	return session;
+}
+
+export async function fulfillShareSession(
+	db: D1Database,
+	id: string,
+	ticket: string,
+	fileMeta: string | null,
 ): Promise<boolean> {
 	const result = await db
-		.prepare("UPDATE magic_link_tokens SET used = 1 WHERE id = ? AND used = 0")
-		.bind(id)
+		.prepare(
+			`UPDATE share_sessions
+			 SET ticket = ?, file_meta = ?
+			 WHERE id = ? AND direction = 'receive' AND ticket IS NULL AND expires_at > ?`,
+		)
+		.bind(ticket, fileMeta, id, unixNowSeconds())
 		.run();
 	return (result.meta?.changes ?? 0) > 0;
 }
 
-export async function cleanupExpiredMagicLinkTokens(
+export async function deleteShareSession(
 	db: D1Database,
-): Promise<number> {
-	const expiredResult = await db
-		.prepare("DELETE FROM magic_link_tokens WHERE expires_at <= ?")
-		.bind(unixNowSeconds())
-		.run();
-	const usedResult = await db
-		.prepare("DELETE FROM magic_link_tokens WHERE used = 1")
-		.run();
-	return (expiredResult.meta?.changes ?? 0) + (usedResult.meta?.changes ?? 0);
-}
-
-export async function cleanupExpiredSessions(db: D1Database): Promise<number> {
-	const result = await db
-		.prepare("DELETE FROM sessions WHERE expires_at <= ?")
-		.bind(unixNowSeconds())
-		.run();
-	return result.meta?.changes ?? 0;
+	id: string,
+): Promise<void> {
+	await db.prepare("DELETE FROM share_sessions WHERE id = ?").bind(id).run();
 }
 
 export async function getUserByEmail(
@@ -215,10 +459,20 @@ export async function getOrCreateUserByEmail(
 	email: string,
 ): Promise<UserRow> {
 	const normalizedEmail = email.toLowerCase();
-	return (
-		(await getUserByEmail(db, normalizedEmail)) ??
-		createUser(db, { email: normalizedEmail })
-	);
+	const id = generateId();
+	const createdAt = unixNowSeconds();
+	const result = await db
+		.prepare(
+			`INSERT INTO users (id, email, created_at) VALUES (?, ?, ?)
+			 ON CONFLICT(email) DO UPDATE SET email = excluded.email
+			 RETURNING ${USER_COLUMNS}`,
+		)
+		.bind(id, normalizedEmail, createdAt)
+		.first<UserRow>();
+	if (!result) {
+		throw new Error("Failed to upsert user by email");
+	}
+	return result;
 }
 
 export async function createUser(
