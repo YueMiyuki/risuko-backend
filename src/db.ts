@@ -212,8 +212,7 @@ export async function cleanupExpired(db: D1Database): Promise<CleanupCounts> {
 export async function createShareSession(
 	db: D1Database,
 	params: {
-		direction: ShareDirection;
-		ticket?: string | null;
+		ticket: string;
 		fileMeta?: string | null;
 		userId?: string | null;
 		expiresAt: number;
@@ -221,7 +220,6 @@ export async function createShareSession(
 ): Promise<ShareSessionRow> {
 	const id = generateId();
 	const createdAt = unixNowSeconds();
-	const ticket = params.ticket ?? null;
 	const fileMeta = params.fileMeta ?? null;
 	const userId = params.userId ?? null;
 
@@ -233,13 +231,12 @@ export async function createShareSession(
 				.prepare(
 					`INSERT INTO share_sessions
 					 (id, device_code, direction, ticket, file_meta, user_id, expires_at, created_at)
-					 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+					 VALUES (?, ?, 'send', ?, ?, ?, ?, ?)`,
 				)
 				.bind(
 					id,
 					deviceCode,
-					params.direction,
-					ticket,
+					params.ticket,
 					fileMeta,
 					userId,
 					params.expiresAt,
@@ -249,8 +246,8 @@ export async function createShareSession(
 			return {
 				id,
 				device_code: deviceCode,
-				direction: params.direction,
-				ticket,
+				direction: "send",
+				ticket: params.ticket,
 				file_meta: fileMeta,
 				user_id: userId,
 				expires_at: params.expiresAt,
@@ -288,51 +285,6 @@ export async function getShareSessionById(
 	return result ?? null;
 }
 
-export async function getShareSessionByDeviceCode(
-	db: D1Database,
-	deviceCode: string,
-): Promise<ShareSessionRow | null> {
-	const result = await db
-		.prepare(
-			`SELECT ${SHARE_SESSION_COLUMNS}
-			 FROM share_sessions
-			 WHERE device_code = ? AND expires_at > ?
-			 LIMIT 1`,
-		)
-		.bind(deviceCode.toUpperCase(), unixNowSeconds())
-		.first<ShareSessionRow>();
-	return result ?? null;
-}
-
-export async function resolveShareSessionByDeviceCode(
-	db: D1Database,
-	deviceCode: string,
-	resolverUserId: string,
-): Promise<ShareSessionRow | null> {
-	const now = unixNowSeconds();
-	const code = deviceCode.toUpperCase();
-
-	const sendPickup = await db
-		.prepare(
-			`DELETE FROM share_sessions
-			 WHERE device_code = ? AND expires_at > ? AND direction = 'send'
-			   AND (user_id IS NULL OR user_id != ?)
-			 RETURNING ${SHARE_SESSION_COLUMNS}`,
-		)
-		.bind(code, now, resolverUserId)
-		.first<ShareSessionRow>();
-	if (sendPickup) {
-		return sendPickup;
-	}
-
-	const session = await getShareSessionByDeviceCode(db, code);
-	if (!session) {
-		return null;
-	}
-
-	return resolveShareSessionRow(db, session, resolverUserId, now);
-}
-
 export async function resolveShareSessionById(
 	db: D1Database,
 	id: string,
@@ -341,15 +293,17 @@ export async function resolveShareSessionById(
 	const now = unixNowSeconds();
 	const lookup = shareLookupKey(id);
 
+	// A non-owner resolving the code claims the session: consume it so the
+	// code is single-use. The owner falls through to a plain read.
 	const sendPickup = await db
 		.prepare(
 			lookup.byCode
 				? `DELETE FROM share_sessions
-				   WHERE device_code = ? AND expires_at > ? AND direction = 'send'
+				   WHERE device_code = ? AND expires_at > ?
 				     AND (user_id IS NULL OR user_id != ?)
 				   RETURNING ${SHARE_SESSION_COLUMNS}`
 				: `DELETE FROM share_sessions
-				   WHERE id = ? AND expires_at > ? AND direction = 'send'
+				   WHERE id = ? AND expires_at > ?
 				     AND (user_id IS NULL OR user_id != ?)
 				   RETURNING ${SHARE_SESSION_COLUMNS}`,
 		)
@@ -359,53 +313,7 @@ export async function resolveShareSessionById(
 		return sendPickup;
 	}
 
-	const session = await getShareSessionById(db, id);
-	if (!session) {
-		return null;
-	}
-
-	return resolveShareSessionRow(db, session, resolverUserId, now);
-}
-
-async function resolveShareSessionRow(
-	db: D1Database,
-	session: ShareSessionRow,
-	resolverUserId: string,
-	now: number,
-): Promise<ShareSessionRow | null> {
-	if (session.direction === "receive" && session.ticket) {
-		if (session.user_id !== resolverUserId) {
-			return null;
-		}
-		const ownerPickup = await db
-			.prepare(
-				`DELETE FROM share_sessions
-				 WHERE id = ? AND user_id = ? AND ticket IS NOT NULL AND expires_at > ?
-				 RETURNING ${SHARE_SESSION_COLUMNS}`,
-			)
-			.bind(session.id, resolverUserId, now)
-			.first<ShareSessionRow>();
-		return ownerPickup ?? session;
-	}
-
-	return session;
-}
-
-export async function fulfillShareSession(
-	db: D1Database,
-	id: string,
-	ticket: string,
-	fileMeta: string | null,
-): Promise<boolean> {
-	const result = await db
-		.prepare(
-			`UPDATE share_sessions
-			 SET ticket = ?, file_meta = ?
-			 WHERE id = ? AND direction = 'receive' AND ticket IS NULL AND expires_at > ?`,
-		)
-		.bind(ticket, fileMeta, id, unixNowSeconds())
-		.run();
-	return (result.meta?.changes ?? 0) > 0;
+	return getShareSessionById(db, id);
 }
 
 export async function deleteShareSession(

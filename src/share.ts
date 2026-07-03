@@ -6,7 +6,6 @@ export interface ShareFileMeta {
 interface ShareLandingCopy {
 	title: string;
 	sendingHeading: string;
-	receivingHeading: string;
 	deviceCodeLabel: string;
 	openButton: string;
 	openHint: string;
@@ -20,7 +19,6 @@ interface ShareLandingCopy {
 const enCopy: ShareLandingCopy = {
 	title: "Risuko file share",
 	sendingHeading: "Someone wants to send you files",
-	receivingHeading: "Someone is waiting to receive files",
 	deviceCodeLabel: "Device code",
 	openButton: "Open in Risuko",
 	openHint:
@@ -35,7 +33,6 @@ const enCopy: ShareLandingCopy = {
 const zhCopy: ShareLandingCopy = {
 	title: "Risuko 文件分享",
 	sendingHeading: "有人想向你发送文件",
-	receivingHeading: "有人正在等待接收文件",
 	deviceCodeLabel: "设备码",
 	openButton: "在 Risuko 中打开",
 	openHint: "已经安装 Risuko？打开应用并输入此设备码，或点击上方按钮。",
@@ -81,14 +78,12 @@ function formatBytes(bytes: number): string {
 export function buildShareLandingPage(params: {
 	shareId: string;
 	deviceCode: string;
-	direction: "send" | "receive";
 	files: ShareFileMeta[];
 	deepLinkScheme: string;
 	locale?: string;
 }): string {
 	const copy = getCopy(params.locale);
-	const heading =
-		params.direction === "send" ? copy.sendingHeading : copy.receivingHeading;
+	const heading = copy.sendingHeading;
 	const deepLink = `${params.deepLinkScheme}://share/${encodeURIComponent(params.deviceCode)}`;
 
 	const filesMarkup =
@@ -101,14 +96,9 @@ export function buildShareLandingPage(params: {
 					.join("")}</ul>`
 			: `<p class="muted">${escapeHtml(copy.noFilesYet)}</p>`;
 
-	const directionLabel =
-		params.direction === "send"
-			? params.locale?.startsWith("zh")
-				? "接收文件"
-				: "Receive files"
-			: params.locale?.startsWith("zh")
-				? "发送文件"
-				: "Send files";
+	const directionLabel = params.locale?.startsWith("zh")
+		? "接收文件"
+		: "Receive files";
 
 	return `<!doctype html>
 <html lang="${escapeHtml(params.locale ?? "en")}">

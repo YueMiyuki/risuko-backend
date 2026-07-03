@@ -1,5 +1,5 @@
-import { Hono } from "hono";
 import type { Context } from "hono";
+import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { checkCooldown } from "./cache";
 import {
@@ -13,17 +13,14 @@ import {
 	deleteSession,
 	deleteSettings,
 	deleteShareSession,
-	fulfillShareSession,
 	generateOTP,
 	getOrCreateUserByEmail,
 	getSettings,
 	getShareSessionById,
-	resolveShareSessionByDeviceCode,
-	resolveShareSessionById,
 	getUserByEmail,
 	getUserByGithubId,
 	getUserBySessionToken,
-	type ShareDirection,
+	resolveShareSessionById,
 	type ShareSessionRow,
 	type UserRow,
 	upsertSettings,
@@ -35,6 +32,7 @@ import {
 	getGithubUser,
 } from "./github";
 import { authMiddleware } from "./middleware";
+import { validateSettingsWrite } from "./settingsSchema";
 import { buildShareLandingPage, type ShareFileMeta } from "./share";
 export interface Env {
 	DB: D1Database;
@@ -365,14 +363,28 @@ app.get("/settings", authMiddleware, async (c) => {
 	return c.json({ settings: result, timestamps });
 });
 
+// Hard cap on a single settings write
+const MAX_SETTINGS_BODY_BYTES = 1024 * 1024;
+
 app.put("/settings", authMiddleware, async (c) => {
 	const userId = c.get("userId");
-	const { category, data } = await c.req.json<{
-		category?: string;
-		data?: unknown;
-	}>();
+	const raw = await c.req.text();
+	if (raw.length > MAX_SETTINGS_BODY_BYTES) {
+		return c.json({ error: "Payload too large" }, 413);
+	}
+	let body: { category?: string; data?: unknown };
+	try {
+		body = JSON.parse(raw);
+	} catch {
+		return c.json({ error: "Invalid JSON body" }, 400);
+	}
+	const { category, data } = body;
 	if (!category || data === undefined) {
 		return c.json({ error: "category and data are required" }, 400);
+	}
+	const rejection = validateSettingsWrite(category, data);
+	if (rejection) {
+		return c.json({ error: rejection }, 400);
 	}
 	const updatedAt = Math.floor(Date.now() / 1000);
 	await upsertSettings(
@@ -506,21 +518,12 @@ app.post("/share", authMiddleware, async (c) => {
 	}
 
 	const body = await c.req.json<{
-		direction?: string;
 		ticket?: string;
 		files?: unknown;
 	}>();
 
-	const direction = body.direction;
-	if (direction !== "send" && direction !== "receive") {
-		return c.json({ error: "direction must be 'send' or 'receive'" }, 400);
-	}
-
-	if (direction === "send" && !body.ticket) {
-		return c.json(
-			{ error: "ticket is required when direction is 'send'" },
-			400,
-		);
+	if (!body.ticket) {
+		return c.json({ error: "ticket is required" }, 400);
 	}
 
 	const files = sanitizeFileMeta(body.files);
@@ -528,8 +531,7 @@ app.post("/share", authMiddleware, async (c) => {
 	const expiresAt = Math.floor(Date.now() / 1000) + SHARE_TTL_SECONDS;
 
 	const session = await createShareSession(c.env.DB, {
-		direction: direction as ShareDirection,
-		ticket: direction === "send" ? body.ticket : null,
+		ticket: body.ticket,
 		fileMeta: files.length > 0 ? JSON.stringify(files) : null,
 		userId,
 		expiresAt,
@@ -540,51 +542,14 @@ app.post("/share", authMiddleware, async (c) => {
 });
 
 app.get("/share/code/:code", authMiddleware, async (c) => {
-	const limited = await shareRateLimit(c, "resolve", 1);
-	if (limited) {
-		return limited;
-	}
 	const code = c.req.param("code");
 	if (!code) {
 		return c.json({ error: "Missing device code" }, 400);
 	}
 	const userId = c.get("userId");
-	const session = await resolveShareSessionByDeviceCode(c.env.DB, code, userId);
+	const session = await resolveShareSessionById(c.env.DB, code, userId);
 	if (!session) {
 		return c.json({ error: "Invalid or expired device code" }, 404);
-	}
-	return c.json(shareSessionToJson(session));
-});
-
-app.post("/share/:id/fulfill", authMiddleware, async (c) => {
-	const limited = await shareRateLimit(c, "fulfill", 1);
-	if (limited) {
-		return limited;
-	}
-	const id = c.req.param("id");
-	if (!id) {
-		return c.json({ error: "Missing share id" }, 400);
-	}
-	const body = await c.req.json<{ ticket?: string; files?: unknown }>();
-	if (!body.ticket) {
-		return c.json({ error: "ticket is required" }, 400);
-	}
-	const files = sanitizeFileMeta(body.files);
-	const ok = await fulfillShareSession(
-		c.env.DB,
-		id,
-		body.ticket,
-		files.length > 0 ? JSON.stringify(files) : null,
-	);
-	if (!ok) {
-		return c.json(
-			{ error: "Share session not found, already fulfilled, or expired" },
-			404,
-		);
-	}
-	const session = await getShareSessionById(c.env.DB, id);
-	if (!session) {
-		return c.json({ error: "Share session not found" }, 404);
 	}
 	return c.json(shareSessionToJson(session));
 });
@@ -604,10 +569,6 @@ app.delete("/share/:id", authMiddleware, async (c) => {
 });
 
 app.get("/share/:id", async (c) => {
-	const limited = await shareRateLimit(c, "get", 1);
-	if (limited) {
-		return limited;
-	}
 	const id = c.req.param("id");
 
 	const wantsJson =
@@ -638,7 +599,6 @@ app.get("/share/:id", async (c) => {
 	const html = buildShareLandingPage({
 		shareId: session.id,
 		deviceCode: session.device_code,
-		direction: session.direction,
 		files: parseFileMeta(session.file_meta),
 		deepLinkScheme: scheme,
 		locale: c.req.query("locale") ?? undefined,

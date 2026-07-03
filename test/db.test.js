@@ -5,11 +5,9 @@ import {
 	consumeMagicLinkTokenByEmailAndCode,
 	createShareSession,
 	createUser,
-	fulfillShareSession,
 	generateDeviceCode,
 	generateOTP,
 	getUserBySessionToken,
-	resolveShareSessionByDeviceCode,
 	resolveShareSessionById,
 } from "../src/db.ts";
 
@@ -206,7 +204,6 @@ test("createShareSession inserts once and returns the row", async () => {
 
 	try {
 		const session = await createShareSession(db, {
-			direction: "send",
 			ticket: "blob-ticket",
 			fileMeta: JSON.stringify([{ name: "a.bin", size: 10 }]),
 			userId: null,
@@ -246,37 +243,15 @@ test("createShareSession retries on a device-code collision", async () => {
 	};
 
 	const session = await createShareSession(db, {
-		direction: "receive",
+		ticket: "blob-ticket",
 		expiresAt: 1_700_003_600,
 	});
 	assert.equal(runCalls, 2);
-	assert.equal(session.direction, "receive");
-	assert.equal(session.ticket, null);
+	assert.equal(session.direction, "send");
+	assert.equal(session.ticket, "blob-ticket");
 });
 
-test("fulfillShareSession only updates an unfulfilled receive session", async () => {
-	let updateSql = "";
-	const db = {
-		prepare(sql) {
-			updateSql = sql;
-			return {
-				bind() {
-					return this;
-				},
-				async run() {
-					return { meta: { changes: 1 } };
-				},
-			};
-		},
-	};
-
-	const ok = await fulfillShareSession(db, "share_1", "blob-ticket", null);
-	assert.equal(ok, true);
-	assert.match(updateSql, /UPDATE share_sessions/);
-	assert.match(updateSql, /direction = 'receive' AND ticket IS NULL/);
-});
-
-test("resolveShareSessionByDeviceCode consumes send sessions for non-owners", async () => {
+test("resolveShareSessionById consumes send sessions for non-owners by device code", async () => {
 	const session = {
 		id: "share_send",
 		device_code: "ABCD1234",
@@ -305,21 +280,17 @@ test("resolveShareSessionByDeviceCode consumes send sessions for non-owners", as
 		},
 	};
 
-	const resolved = await resolveShareSessionByDeviceCode(
-		db,
-		"abcd1234",
-		"peer",
-	);
+	const resolved = await resolveShareSessionById(db, "abcd1234", "peer");
 	assert.equal(resolved?.id, "share_send");
-	assert.match(deleteSql, /direction = 'send'/);
+	assert.match(deleteSql, /device_code = \?/);
 	assert.match(deleteSql, /user_id != \?/);
 });
 
-test("resolveShareSessionById blocks non-owners once a receive ticket exists", async () => {
+test("resolveShareSessionById falls back to a plain read for the owner", async () => {
 	const session = {
-		id: "share_recv",
+		id: "share_send",
 		device_code: "WXYZ5678",
-		direction: "receive",
+		direction: "send",
 		ticket: "blob-ticket",
 		file_meta: null,
 		user_id: "owner",
@@ -347,7 +318,7 @@ test("resolveShareSessionById blocks non-owners once a receive ticket exists", a
 		},
 	};
 
-	const resolved = await resolveShareSessionById(db, "share_recv", "peer");
-	assert.equal(resolved, null);
+	const resolved = await resolveShareSessionById(db, "share_send", "owner");
+	assert.equal(resolved?.id, "share_send");
 	assert.equal(prepareCalls, 2);
 });
