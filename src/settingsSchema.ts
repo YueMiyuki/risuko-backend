@@ -47,6 +47,15 @@ const flatRecord =
 		);
 	};
 
+const jsonObject =
+	(maxBytes: number): Validator =>
+	(v) => {
+		if (!isPlainObject(v)) {
+			return false;
+		}
+		return JSON.stringify(v).length <= maxBytes;
+	};
+
 const shape =
 	(fields: Record<string, Validator>): Validator =>
 	(v) => {
@@ -78,7 +87,6 @@ const taskRoutingRule = shape({
 	dir: str(1024),
 	enabled: bool,
 });
-
 
 const savedCredential: Validator = (v) => {
 	if (!isPlainObject(v)) {
@@ -168,6 +176,12 @@ export const SETTINGS_SCHEMA: Record<string, Record<string, Validator>> = {
 	rss: {
 		"rss-auto-update": bool,
 		"rss-update-interval": scalar(32),
+	},
+	stats: {
+		version: scalar(16),
+		baselines: jsonObject(1024 * 1024),
+		monthly: jsonObject(1024 * 1024),
+		speed: jsonObject(1024 * 1024),
 	},
 	"task-routing": {
 		"task-routing-rules": arrayOf(64, taskRoutingRule),
@@ -261,6 +275,33 @@ export const SETTINGS_SCHEMA: Record<string, Record<string, Validator>> = {
 	},
 };
 
+// Catch-all category: accepts any key (size/shape-bounded) so newly added
+// client settings sync without a schema edit here. Values are capped, not
+// key-checked — a sensitive new setting should get its own named category.
+export const MISC_CATEGORY = "misc";
+
+const miscValue: Validator = (v) =>
+	v === null ||
+	scalar(8192)(v) ||
+	strArr(512, 256)(v) ||
+	flatRecord(128, 64, 8192)(v);
+
+function validateMiscWrite(data: Record<string, unknown>): string | null {
+	const entries = Object.entries(data);
+	if (entries.length > 256) {
+		return "too many keys in misc category";
+	}
+	for (const [key, value] of entries) {
+		if (key.length > 64) {
+			return `key "${key.slice(0, 64)}" is too long in misc category`;
+		}
+		if (value !== undefined && !miscValue(value)) {
+			return `invalid value for key "${key}" in misc category`;
+		}
+	}
+	return null;
+}
+
 export function validateSettingsWrite(
 	category: unknown,
 	data: unknown,
@@ -268,12 +309,15 @@ export function validateSettingsWrite(
 	if (typeof category !== "string") {
 		return "category must be a string";
 	}
+	if (!isPlainObject(data)) {
+		return "data must be an object";
+	}
+	if (category === MISC_CATEGORY) {
+		return validateMiscWrite(data);
+	}
 	const keySchema = SETTINGS_SCHEMA[category];
 	if (!keySchema) {
 		return `unknown settings category "${category.slice(0, 64)}"`;
-	}
-	if (!isPlainObject(data)) {
-		return "data must be an object";
 	}
 	for (const [key, value] of Object.entries(data)) {
 		const check = keySchema[key];

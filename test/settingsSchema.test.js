@@ -152,8 +152,65 @@ test("protocols is a flat record", () => {
 	);
 });
 
+test("stats category accepts the exported stats store shape", () => {
+	assert.equal(
+		validateSettingsWrite("stats", {
+			version: 1,
+			baselines: {
+				abc: { completedLength: 10, kind: "http" },
+			},
+			monthly: {
+				"2026-07": { http: 10 },
+			},
+			speed: {
+				1783200000: {
+					month: "2026-07",
+					protocols: {
+						http: {
+							downloadSum: 100,
+							uploadSum: 0,
+							samples: 1,
+							receivedBytes: 10,
+						},
+					},
+				},
+			},
+		}),
+		null,
+	);
+	assert.match(
+		validateSettingsWrite("stats", { surprise: true }),
+		/not allowed/,
+	);
+});
+
 test("every category has at least one key", () => {
 	for (const [category, keys] of Object.entries(SETTINGS_SCHEMA)) {
 		assert.ok(Object.keys(keys).length > 0, `empty category ${category}`);
 	}
+});
+
+test("misc catch-all accepts arbitrary bounded keys (incl. new settings)", () => {
+	assert.equal(
+		validateSettingsWrite("misc", {
+			"clipboard-watch": true,
+			"clipboard-watch-extensions": ["zip", "iso", "torrent"],
+			"clipboard-watch-notice-seen": true,
+			"legal-accepted": false,
+			"some-future-setting": "value",
+			"a-future-number": 42,
+		}),
+		null,
+	);
+});
+
+test("misc rejects malformed or oversized entries", () => {
+	assert.match(
+		validateSettingsWrite("misc", { k: { nested: { too: "deep" } } }),
+		/invalid value/,
+	);
+	assert.match(
+		validateSettingsWrite("misc", { ["x".repeat(65)]: 1 }),
+		/too long/,
+	);
 });
